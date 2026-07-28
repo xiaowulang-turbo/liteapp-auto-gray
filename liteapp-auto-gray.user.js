@@ -1,12 +1,16 @@
 // ==UserScript==
 // @name         Liteapp 灰度自动上线
 // @namespace    https://lite.weixin.woa.com/
-// @version      1.5.0
+// @version      1.5.1
 // @description  自动检测并点击"灰度上线"和"结单"按钮，弹窗中自动确认。使用静音音频循环播放对抗 Chrome 后台 tab 节流
 // @author       xiaowuruan
 // @match        https://lite.weixin.woa.com/console/*/release/change/info/*
 // @grant        none
 // @run-at       document-end
+// @updateURL    https://raw.githubusercontent.com/xiaowulang-turbo/liteapp-auto-gray/main/liteapp-auto-gray.user.js
+// @downloadURL  https://raw.githubusercontent.com/xiaowulang-turbo/liteapp-auto-gray/main/liteapp-auto-gray.user.js
+// @supportURL   https://github.com/xiaowulang-turbo/liteapp-auto-gray/issues
+// @homepageURL  https://github.com/xiaowulang-turbo/liteapp-auto-gray
 // ==/UserScript==
 
 (function () {
