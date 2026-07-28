@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Liteapp 灰度自动上线
 // @namespace    https://lite.weixin.woa.com/
-// @version      1.3.0
-// @description  自动检测并点击"灰度上线"按钮，弹窗中自动确认。使用 helper tab + Web Worker 多重保活机制对抗后台 tab 节流
+// @version      1.4.0
+// @description  自动检测并点击"灰度上线"按钮，弹窗中自动确认。使用静音音频循环播放对抗 Chrome 后台 tab 节流（Intensive Throttling）
 // @author       xiaowuruan
 // @match        https://lite.weixin.woa.com/console/*/release/change/info/*
 // @grant        none
@@ -14,10 +14,9 @@
 
   // ==================== 常量 ====================
 
-  const POLL_INTERVAL = 3000;            // 前台轮询间隔：3 秒
+  const POLL_INTERVAL = 3000;            // 主轮询：3 秒
   const DIALOG_POLL_INTERVAL = 500;      // 弹窗轮询：0.5 秒
-  const HEARTBEAT_INTERVAL = 1000;       // Worker 心跳：1 秒
-  const HELPER_TAB_INTERVAL = 5000;      // Helper tab 心跳：5 秒
+  const HEARTBEAT_INTERVAL = 2000;       // Worker 心跳：2 秒
 
   // ==================== 状态 ====================
 
@@ -26,17 +25,17 @@
   let lastClickTime = null;
   let isConfirming = false;
   let worker = null;
-  let helperTab = null;
-  let helperTabReady = false;
-  let broadcastChannel = null;
+  let audioCtx = null;
+  let audioNode = null;
+  let wakeLock = null;
+  let audioActivated = false;
 
-  // ==================== 灰度上线按钮相关 ====================
+  // ==================== 灰度上线按钮 ====================
 
   function findGrayButton() {
     const buttons = document.querySelectorAll('button');
     for (const btn of buttons) {
-      const text = btn.textContent.trim();
-      if (text.includes('灰度上线')) {
+      if (btn.textContent.trim().includes('灰度上线')) {
         return btn;
       }
     }
@@ -47,18 +46,12 @@
     return !btn.disabled && !btn.classList.contains('t-is-disabled');
   }
 
-  function extractCountdown(btn) {
-    const match = btn.textContent.match(/\((\d+)秒\)/);
-    return match ? parseInt(match[1], 10) : null;
-  }
-
-  // ==================== 弹窗确认相关 ====================
+  // ==================== 弹窗确认 ====================
 
   function findDialogConfirmButton() {
     const dialogs = document.querySelectorAll('.t-dialog__ctx');
     for (const dialog of dialogs) {
-      const style = window.getComputedStyle(dialog);
-      if (style.display === 'none') continue;
+      if (window.getComputedStyle(dialog).display === 'none') continue;
 
       const title = dialog.querySelector('.t-dialog__header-content');
       if (!title || !title.textContent.includes('灰度上线')) continue;
@@ -130,103 +123,147 @@
     if (isConfirming) return;
 
     const btn = findGrayButton();
-    if (!btn) {
-      // 按钮消失不代表完成，可能只是被切到告警 tab 了
-      return;
-    }
+    if (!btn) return;
 
     if (isButtonEnabled(btn)) {
-      // 防止短时间内重复点击
       if (lastClickTime && (Date.now() - lastClickTime.getTime()) < 30000) {
         return;
       }
-      console.log(`[灰度自动上线] 🎯 检测到可点击按钮 (来源: ${source})`);
+      console.log(`[灰度自动上线] 🎯 检测到可点击按钮 (来源: ${source}, hidden: ${document.hidden})`);
       clickGrayButton(btn);
     }
   }
 
-  // ==================== Helper Tab 策略 ====================
+  // ==================== 静音音频保活（核心）====================
 
   /**
-   * 创建一个隐藏的 helper tab，让 Chrome 不会将主 tab 视为"完全后台"
-   * 多个 tab 轮换前台是 Chrome 自身的机制
+   * 播放静音音频，让 Chrome 认为 tab 在"播放媒体"
+   * 这样可以绕过 Intensive Throttling（后台 5 分钟后节流到 1 分钟）
+   *
+   * 原理：Chrome 的 Intensive Throttling 会跳过正在播放音频的 tab
+   * 因此播放一段无限循环的静音，可以让 tab 保持"活跃"状态
+   *
+   * 注意：需要用户手势才能启动 AudioContext（autoplay policy）
    */
-  function setupHelperTab() {
-    // 使用 BroadcastChannel 在主 tab 和 helper tab 之间通信
-    if (typeof BroadcastChannel !== 'undefined') {
-      broadcastChannel = new BroadcastChannel('liteapp-gray-helper');
-      broadcastChannel.onmessage = (e) => {
-        if (e.data.type === 'helper-ready') {
-          helperTabReady = true;
-          console.log('[灰度自动上线] 🛰️  Helper tab 已就绪');
-        } else if (e.data.type === 'heartbeat-from-helper') {
-          // Helper tab 5 秒一次心跳，收到时立即检查
-          checkAndClick('helper-tab');
-        } else if (e.data.type === 'check-now') {
-          checkAndClick('helper-tab-request');
-        }
-      };
-    }
+  function startSilentAudio() {
+    if (audioActivated) return;
 
-    // 尝试打开一个隐藏的 helper tab（小窗口，Chrome 会优先调度它）
     try {
-      const helperUrl = window.location.origin + window.location.pathname + '?_helper=1#' + Date.now();
-      helperTab = window.open('about:blank', 'liteapp-gray-helper-window', 'width=1,height=1,left=-9999,top=-9999');
-      if (helperTab) {
-        // 写入 helper 脚本
-        helperTab.document.write(`
-          <!DOCTYPE html>
-          <html>
-          <head><title>灰度辅助</title></head>
-          <body>
-            <script>
-              (function() {
-                const channel = new BroadcastChannel('liteapp-gray-helper');
-                channel.postMessage({ type: 'helper-ready' });
+      const AudioContextCls = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCls) {
+        console.warn('[灰度自动上线] ⚠️ 浏览器不支持 AudioContext');
+        return;
+      }
 
-                // 每 ${HELPER_TAB_INTERVAL / 1000} 秒向主 tab 发心跳
-                setInterval(() => {
-                  channel.postMessage({ type: 'heartbeat-from-helper' });
-                }, ${HELPER_TAB_INTERVAL});
+      audioCtx = new AudioContextCls();
 
-                // 保持页面活跃的小技巧
-                setInterval(() => {
-                  // 触发无害的微任务
-                  Promise.resolve();
-                }, 1000);
+      // 创建一个无限循环的静音 buffer
+      const buffer = audioCtx.createBuffer(1, audioCtx.sampleRate * 2, audioCtx.sampleRate);
+      // 全零，静音
 
-                document.title = '灰度辅助运行中';
-              })();
-            </script>
-          </body>
-          </html>
-        `);
-        helperTab.document.close();
-        console.log('[灰度自动上线] 🛰️  已创建 Helper tab');
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.loop = true;
+
+      // 通过 GainNode 设为音量 0（双重保险）
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = 0;
+
+      source.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      source.start(0);
+
+      audioNode = source;
+
+      // 检查 audioCtx 状态
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().then(() => {
+          audioActivated = true;
+          console.log('[灰度自动上线] 🎵 静音音频保活已激活（AudioContext resumed）');
+        }).catch(e => {
+          console.warn('[灰度自动上线] ⚠️ AudioContext resume 失败:', e.message);
+        });
+      } else {
+        audioActivated = true;
+        console.log('[灰度自动上线] 🎵 静音音频保活已激活');
       }
     } catch (e) {
-      console.warn('[灰度自动上线] ⚠️  Helper tab 创建失败（可能被浏览器拦截）:', e.message);
+      console.warn('[灰度自动上线] ⚠️ 静音音频启动失败:', e.message);
     }
   }
 
-  // ==================== Web Worker 策略 ====================
+  /**
+   * 由于 autoplay policy，AudioContext 必须在用户交互后才能启动
+   * 因此监听一次性用户交互事件来激活音频
+   */
+  function setupAudioActivation() {
+    const activate = () => {
+      startSilentAudio();
+      // 只需激活一次，然后移除监听
+      ['click', 'keydown', 'touchstart', 'mousedown'].forEach(evt => {
+        window.removeEventListener(evt, activate, true);
+      });
+    };
+
+    // 尝试立即启动（部分浏览器/场景可能已经允许）
+    startSilentAudio();
+
+    // 如果失败，等待用户交互
+    if (!audioActivated) {
+      ['click', 'keydown', 'touchstart', 'mousedown'].forEach(evt => {
+        window.addEventListener(evt, activate, true);
+      });
+      console.log('[灰度自动上线] 💡 请在页面任意位置点击一次以激活后台保活');
+    }
+  }
+
+  // ==================== Wake Lock（辅助）====================
 
   /**
-   * Web Worker 高频心跳
-   * 注意：Chrome 后台 tab 也会节流 Worker postMessage 的派发，
-   * 但节流粒度是 1 秒（比主线程的 60 秒更频繁）
+   * 请求 Screen Wake Lock，防止屏幕休眠导致 tab 被冻结
+   * 注意：wakeLock 主要防屏幕休眠，对 tab 后台节流帮助有限
+   */
+  async function requestWakeLock() {
+    if (!('wakeLock' in navigator)) return;
+
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      console.log('[灰度自动上线] 🔒 Wake Lock 已获取');
+
+      wakeLock.addEventListener('release', () => {
+        console.log('[灰度自动上线] 🔓 Wake Lock 已释放');
+      });
+
+      // 页面回到前台时重新请求（Chrome 会在切走时自动释放）
+      document.addEventListener('visibilitychange', async () => {
+        if (!document.hidden && !wakeLock) {
+          try {
+            wakeLock = await navigator.wakeLock.request('screen');
+          } catch (e) {}
+        }
+      });
+    } catch (e) {
+      console.warn('[灰度自动上线] ⚠️ Wake Lock 失败:', e.message);
+    }
+  }
+
+  // ==================== Web Worker 心跳（辅助）====================
+
+  /**
+   * Worker 心跳配合静音音频后：
+   * - 有音频保活时：Worker 每 2 秒精准派发
+   * - 无音频保活时：后台 5 分钟后被节流到 1 分钟
    */
   function createHeartbeatWorker() {
     const workerCode = `
       let count = 0;
       let timerId = null;
-
       self.onmessage = function(e) {
         if (e.data === 'start') {
           if (timerId) clearInterval(timerId);
           timerId = setInterval(() => {
             count++;
-            self.postMessage({ tick: count, ts: Date.now() });
+            self.postMessage({ tick: count });
           }, ${HEARTBEAT_INTERVAL});
         } else if (e.data === 'stop') {
           clearInterval(timerId);
@@ -240,8 +277,7 @@
     worker = new Worker(url);
     URL.revokeObjectURL(url);
 
-    worker.onmessage = (e) => {
-      // Worker 心跳触发时执行检测（即使在后台也比主线程 60s 节流好得多）
+    worker.onmessage = () => {
       checkAndClick('worker');
     };
 
@@ -251,16 +287,11 @@
   // ==================== 定时器管理 ====================
 
   function startPolling() {
-    // 主线程高频轮询（前台时正常工作）
     pollTimer = setInterval(() => {
       checkAndClick('main');
     }, POLL_INTERVAL);
 
-    // Worker 心跳（1 秒一次，后台被节流到 1 秒仍然有效）
     createHeartbeatWorker();
-
-    // Helper tab 心跳（5 秒一次，前台触发，绕过主线程节流）
-    setupHelperTab();
   }
 
   function stopAll() {
@@ -270,12 +301,17 @@
       worker.terminate();
       worker = null;
     }
-    if (helperTab && !helperTab.closed) {
-      try { helperTab.close(); } catch (e) {}
+    if (audioNode) {
+      try { audioNode.stop(); } catch (e) {}
+      audioNode = null;
     }
-    if (broadcastChannel) {
-      broadcastChannel.close();
-      broadcastChannel = null;
+    if (audioCtx) {
+      try { audioCtx.close(); } catch (e) {}
+      audioCtx = null;
+    }
+    if (wakeLock) {
+      wakeLock.release();
+      wakeLock = null;
     }
     stopDialogPolling();
   }
@@ -285,13 +321,14 @@
   function showStatus() {
     console.log(`
     ┌──────────────────────────────────────────┐
-    │  🔧 灰度自动上线脚本 v1.3.0 已启动         │
-    │  🔄 主轮询: 3 秒 (前台)                    │
-    │  💬 弹窗轮询: 0.5 秒                       │
-    │  💓 Worker 心跳: 1 秒 (后台仍有效)          │
-    │  🛰️  Helper tab 心跳: 5 秒 (绕过主线程节流) │
-    │  📍 visibilitychange 立即检查              │
-    │  🎯 目标: ${window.location.href}          │
+    │  🔧 灰度自动上线脚本 v1.4.0 已启动         │
+    │  🎵 静音音频保活: 绕过 Intensive Throttling │
+    │  💓 Worker 心跳: 每 2 秒                    │
+    │  🔒 Wake Lock: 防屏幕休眠                   │
+    │  🔄 主轮询: 3 秒                            │
+    │  💬 弹窗轮询: 0.5 秒                        │
+    │  📍 切回前台立即检查                        │
+    │  💡 首次使用请点击页面激活音频               │
     └──────────────────────────────────────────┘
     `);
   }
@@ -299,17 +336,21 @@
   function init() {
     showStatus();
 
+    // 启动主循环
     setTimeout(() => checkAndClick('init'), 2000);
-
     startPolling();
 
-    // 页面可见性变化时立即检查
+    // 启动保活机制
+    setupAudioActivation();
+    requestWakeLock();
+
+    // 可见性监听
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
         console.log('[灰度自动上线] 📍 页面切回前台，立即检查...');
         checkAndClick('visibilitychange');
       } else {
-        console.log('[灰度自动上线] 🌙 页面进入后台，依赖 Worker + Helper tab...');
+        console.log(`[灰度自动上线] 🌙 页面进入后台，音频保活: ${audioActivated ? '已激活' : '未激活'}`);
       }
     });
   }
