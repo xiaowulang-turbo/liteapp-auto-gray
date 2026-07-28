@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Liteapp 灰度自动上线
 // @namespace    https://lite.weixin.woa.com/
-// @version      1.4.0
-// @description  自动检测并点击"灰度上线"按钮，弹窗中自动确认。使用静音音频循环播放对抗 Chrome 后台 tab 节流（Intensive Throttling）
+// @version      1.5.0
+// @description  自动检测并点击"灰度上线"和"结单"按钮，弹窗中自动确认。使用静音音频循环播放对抗 Chrome 后台 tab 节流
 // @author       xiaowuruan
 // @match        https://lite.weixin.woa.com/console/*/release/change/info/*
 // @grant        none
@@ -17,6 +17,22 @@
   const POLL_INTERVAL = 3000;            // 主轮询：3 秒
   const DIALOG_POLL_INTERVAL = 500;      // 弹窗轮询：0.5 秒
   const HEARTBEAT_INTERVAL = 2000;       // Worker 心跳：2 秒
+  const DIALOG_TIMEOUT = 10000;          // 弹窗检测超时：10 秒
+  const REPEAT_COOLDOWN = 30000;         // 重复点击冷却：30 秒
+
+  // 目标按钮定义
+  const TARGETS = [
+    {
+      name: '灰度上线',
+      match: (btn) => btn.textContent.trim().includes('灰度上线'),
+      dialogTitle: '灰度上线',
+    },
+    {
+      name: '结单',
+      match: (btn) => btn.textContent.trim() === '结单',
+      dialogTitle: '结单',
+    },
+  ];
 
   // ==================== 状态 ====================
 
@@ -30,13 +46,19 @@
   let wakeLock = null;
   let audioActivated = false;
 
-  // ==================== 灰度上线按钮 ====================
+  // ==================== 按钮查找 ====================
 
-  function findGrayButton() {
+  /**
+   * 按优先级查找目标按钮（灰度上线 > 结单）
+   * 返回 { btn, target } 或 null
+   */
+  function findTargetButton() {
     const buttons = document.querySelectorAll('button');
-    for (const btn of buttons) {
-      if (btn.textContent.trim().includes('灰度上线')) {
-        return btn;
+    for (const target of TARGETS) {
+      for (const btn of buttons) {
+        if (target.match(btn)) {
+          return { btn, target };
+        }
       }
     }
     return null;
@@ -48,14 +70,28 @@
 
   // ==================== 弹窗确认 ====================
 
-  function findDialogConfirmButton() {
+  /**
+   * 查找可见弹窗中的"确定"按钮
+   * 支持两种结构：
+   *   1) TDesign 标准 footer 按钮（class 含 t-dialog__confirm，如"结单"弹窗）
+   *   2) body/form 中的自定义确定按钮（如"灰度上线"弹窗）
+   */
+  function findDialogConfirmButton(dialogTitleKeyword) {
     const dialogs = document.querySelectorAll('.t-dialog__ctx');
     for (const dialog of dialogs) {
       if (window.getComputedStyle(dialog).display === 'none') continue;
 
+      // 通过标题关键字锁定弹窗，避免误点其他弹窗
       const title = dialog.querySelector('.t-dialog__header-content');
-      if (!title || !title.textContent.includes('灰度上线')) continue;
+      if (!title || !title.textContent.includes(dialogTitleKeyword)) continue;
 
+      // 优先：TDesign 标准 footer 确认按钮
+      const stdConfirm = dialog.querySelector('.t-dialog__confirm');
+      if (stdConfirm && !stdConfirm.disabled) {
+        return stdConfirm;
+      }
+
+      // 兜底：文本为"确定"的按钮
       const buttons = dialog.querySelectorAll('button');
       for (const btn of buttons) {
         if (btn.textContent.trim() === '确定' && !btn.disabled) {
@@ -67,21 +103,21 @@
   }
 
   function clickDialogConfirm(btn) {
-    console.log('[灰度自动上线] ✅ 点击弹窗确认按钮...');
+    console.log('[自动上线] ✅ 点击弹窗"确定"按钮...');
     btn.click();
     btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     isConfirming = false;
-    console.log('[灰度自动上线] ✅ 弹窗已确认，等待下一轮灰度...');
+    console.log('[自动上线] ✅ 弹窗已确认');
   }
 
-  function startDialogPolling() {
+  function startDialogPolling(dialogTitleKeyword) {
     if (dialogTimer) return;
     isConfirming = true;
 
-    console.log('[灰度自动上线] 🔍 开始检测确认弹窗...');
+    console.log(`[自动上线] 🔍 检测"${dialogTitleKeyword}"确认弹窗...`);
     dialogTimer = setInterval(() => {
-      const confirmBtn = findDialogConfirmButton();
+      const confirmBtn = findDialogConfirmButton(dialogTitleKeyword);
       if (confirmBtn) {
         clickDialogConfirm(confirmBtn);
         stopDialogPolling();
@@ -90,11 +126,11 @@
 
     setTimeout(() => {
       if (dialogTimer) {
-        console.log('[灰度自动上线] ⚠️ 弹窗检测超时');
+        console.log('[自动上线] ⚠️ 弹窗检测超时');
         stopDialogPolling();
         isConfirming = false;
       }
-    }, 10000);
+    }, DIALOG_TIMEOUT);
   }
 
   function stopDialogPolling() {
@@ -106,8 +142,8 @@
 
   // ==================== 主逻辑 ====================
 
-  function clickGrayButton(btn) {
-    console.log('[灰度自动上线] 🚀 点击灰度上线按钮...');
+  function clickTargetButton(btn, target) {
+    console.log(`[自动上线] 🚀 点击"${target.name}"按钮...`);
     lastClickTime = new Date();
 
     btn.disabled = false;
@@ -116,56 +152,42 @@
     btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
     btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
 
-    startDialogPolling();
+    startDialogPolling(target.dialogTitle);
   }
 
   function checkAndClick(source) {
     if (isConfirming) return;
 
-    const btn = findGrayButton();
-    if (!btn) return;
+    const found = findTargetButton();
+    if (!found) return;
 
-    if (isButtonEnabled(btn)) {
-      if (lastClickTime && (Date.now() - lastClickTime.getTime()) < 30000) {
-        return;
-      }
-      console.log(`[灰度自动上线] 🎯 检测到可点击按钮 (来源: ${source}, hidden: ${document.hidden})`);
-      clickGrayButton(btn);
+    const { btn, target } = found;
+    if (!isButtonEnabled(btn)) return;
+
+    if (lastClickTime && (Date.now() - lastClickTime.getTime()) < REPEAT_COOLDOWN) {
+      return;
     }
+
+    console.log(`[自动上线] 🎯 检测到"${target.name}"可点击 (来源: ${source}, hidden: ${document.hidden})`);
+    clickTargetButton(btn, target);
   }
 
-  // ==================== 静音音频保活（核心）====================
+  // ==================== 静音音频保活 ====================
 
-  /**
-   * 播放静音音频，让 Chrome 认为 tab 在"播放媒体"
-   * 这样可以绕过 Intensive Throttling（后台 5 分钟后节流到 1 分钟）
-   *
-   * 原理：Chrome 的 Intensive Throttling 会跳过正在播放音频的 tab
-   * 因此播放一段无限循环的静音，可以让 tab 保持"活跃"状态
-   *
-   * 注意：需要用户手势才能启动 AudioContext（autoplay policy）
-   */
   function startSilentAudio() {
     if (audioActivated) return;
 
     try {
       const AudioContextCls = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextCls) {
-        console.warn('[灰度自动上线] ⚠️ 浏览器不支持 AudioContext');
-        return;
-      }
+      if (!AudioContextCls) return;
 
       audioCtx = new AudioContextCls();
 
-      // 创建一个无限循环的静音 buffer
       const buffer = audioCtx.createBuffer(1, audioCtx.sampleRate * 2, audioCtx.sampleRate);
-      // 全零，静音
-
       const source = audioCtx.createBufferSource();
       source.buffer = buffer;
       source.loop = true;
 
-      // 通过 GainNode 设为音量 0（双重保险）
       const gainNode = audioCtx.createGain();
       gainNode.gain.value = 0;
 
@@ -175,66 +197,49 @@
 
       audioNode = source;
 
-      // 检查 audioCtx 状态
       if (audioCtx.state === 'suspended') {
         audioCtx.resume().then(() => {
           audioActivated = true;
-          console.log('[灰度自动上线] 🎵 静音音频保活已激活（AudioContext resumed）');
-        }).catch(e => {
-          console.warn('[灰度自动上线] ⚠️ AudioContext resume 失败:', e.message);
-        });
+          console.log('[自动上线] 🎵 静音音频保活已激活');
+        }).catch(() => {});
       } else {
         audioActivated = true;
-        console.log('[灰度自动上线] 🎵 静音音频保活已激活');
+        console.log('[自动上线] 🎵 静音音频保活已激活');
       }
     } catch (e) {
-      console.warn('[灰度自动上线] ⚠️ 静音音频启动失败:', e.message);
+      console.warn('[自动上线] ⚠️ 静音音频启动失败:', e.message);
     }
   }
 
-  /**
-   * 由于 autoplay policy，AudioContext 必须在用户交互后才能启动
-   * 因此监听一次性用户交互事件来激活音频
-   */
   function setupAudioActivation() {
     const activate = () => {
       startSilentAudio();
-      // 只需激活一次，然后移除监听
       ['click', 'keydown', 'touchstart', 'mousedown'].forEach(evt => {
         window.removeEventListener(evt, activate, true);
       });
     };
 
-    // 尝试立即启动（部分浏览器/场景可能已经允许）
     startSilentAudio();
 
-    // 如果失败，等待用户交互
     if (!audioActivated) {
       ['click', 'keydown', 'touchstart', 'mousedown'].forEach(evt => {
         window.addEventListener(evt, activate, true);
       });
-      console.log('[灰度自动上线] 💡 请在页面任意位置点击一次以激活后台保活');
+      console.log('[自动上线] 💡 请点击页面一次以激活后台保活');
     }
   }
 
-  // ==================== Wake Lock（辅助）====================
+  // ==================== Wake Lock ====================
 
-  /**
-   * 请求 Screen Wake Lock，防止屏幕休眠导致 tab 被冻结
-   * 注意：wakeLock 主要防屏幕休眠，对 tab 后台节流帮助有限
-   */
   async function requestWakeLock() {
     if (!('wakeLock' in navigator)) return;
 
     try {
       wakeLock = await navigator.wakeLock.request('screen');
-      console.log('[灰度自动上线] 🔒 Wake Lock 已获取');
-
       wakeLock.addEventListener('release', () => {
-        console.log('[灰度自动上线] 🔓 Wake Lock 已释放');
+        wakeLock = null;
       });
 
-      // 页面回到前台时重新请求（Chrome 会在切走时自动释放）
       document.addEventListener('visibilitychange', async () => {
         if (!document.hidden && !wakeLock) {
           try {
@@ -242,29 +247,18 @@
           } catch (e) {}
         }
       });
-    } catch (e) {
-      console.warn('[灰度自动上线] ⚠️ Wake Lock 失败:', e.message);
-    }
+    } catch (e) {}
   }
 
-  // ==================== Web Worker 心跳（辅助）====================
+  // ==================== Web Worker 心跳 ====================
 
-  /**
-   * Worker 心跳配合静音音频后：
-   * - 有音频保活时：Worker 每 2 秒精准派发
-   * - 无音频保活时：后台 5 分钟后被节流到 1 分钟
-   */
   function createHeartbeatWorker() {
     const workerCode = `
-      let count = 0;
       let timerId = null;
       self.onmessage = function(e) {
         if (e.data === 'start') {
           if (timerId) clearInterval(timerId);
-          timerId = setInterval(() => {
-            count++;
-            self.postMessage({ tick: count });
-          }, ${HEARTBEAT_INTERVAL});
+          timerId = setInterval(() => self.postMessage('tick'), ${HEARTBEAT_INTERVAL});
         } else if (e.data === 'stop') {
           clearInterval(timerId);
           timerId = null;
@@ -277,20 +271,14 @@
     worker = new Worker(url);
     URL.revokeObjectURL(url);
 
-    worker.onmessage = () => {
-      checkAndClick('worker');
-    };
-
+    worker.onmessage = () => checkAndClick('worker');
     worker.postMessage('start');
   }
 
   // ==================== 定时器管理 ====================
 
   function startPolling() {
-    pollTimer = setInterval(() => {
-      checkAndClick('main');
-    }, POLL_INTERVAL);
-
+    pollTimer = setInterval(() => checkAndClick('main'), POLL_INTERVAL);
     createHeartbeatWorker();
   }
 
@@ -321,13 +309,11 @@
   function showStatus() {
     console.log(`
     ┌──────────────────────────────────────────┐
-    │  🔧 灰度自动上线脚本 v1.4.0 已启动         │
-    │  🎵 静音音频保活: 绕过 Intensive Throttling │
+    │  🔧 Liteapp 自动上线脚本 v1.5.0 已启动     │
+    │  🎯 目标按钮: 灰度上线 → 结单              │
+    │  🎵 静音音频保活: 绕过后台节流              │
     │  💓 Worker 心跳: 每 2 秒                    │
-    │  🔒 Wake Lock: 防屏幕休眠                   │
-    │  🔄 主轮询: 3 秒                            │
-    │  💬 弹窗轮询: 0.5 秒                        │
-    │  📍 切回前台立即检查                        │
+    │  🔄 主轮询: 3 秒 / 弹窗轮询: 0.5 秒         │
     │  💡 首次使用请点击页面激活音频               │
     └──────────────────────────────────────────┘
     `);
@@ -336,21 +322,16 @@
   function init() {
     showStatus();
 
-    // 启动主循环
     setTimeout(() => checkAndClick('init'), 2000);
     startPolling();
 
-    // 启动保活机制
     setupAudioActivation();
     requestWakeLock();
 
-    // 可见性监听
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) {
-        console.log('[灰度自动上线] 📍 页面切回前台，立即检查...');
+        console.log('[自动上线] 📍 页面切回前台，立即检查...');
         checkAndClick('visibilitychange');
-      } else {
-        console.log(`[灰度自动上线] 🌙 页面进入后台，音频保活: ${audioActivated ? '已激活' : '未激活'}`);
       }
     });
   }
